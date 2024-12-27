@@ -17,6 +17,7 @@ MODEL:
     COMMON_STRIDE: 4
     TRANSFORMER_ENC_LAYERS: 6
   MASK_FORMER:
+    TRAIN_CLASS_JSON: "/data_16T/tc/tiancong/code/mask2former/mask2former/mask2former/datasets/coco.json"
     TRANSFORMER_DECODER_NAME: "MultiScaleMaskedTransformerDecoder"
     TRANSFORMER_IN_FEATURE: "multi_scale_pixel_decoder"
     DEEP_SUPERVISION: True
@@ -39,7 +40,16 @@ MODEL:
     IMPORTANCE_SAMPLE_RATIO: 0.75
     TEST:
       SEMANTIC_ON: True
-      INSTANCE_ON: True
-      PANOPTIC_ON: True
+      INSTANCE_ON: False
+      PANOPTIC_ON: False
       OVERLAP_THRESHOLD: 0.8
       OBJECT_MASK_THRESHOLD: 0.8
+  TEXT:
+    TEXT_DECODER: '/data_16T/tc/tiancong/code/GenerateU/GenerateU/projects/DDETRS/ddetrs/models/deformable_detr/google/flan-t5-base'
+    FIX_TEXT_DECODER: True
+    USE_GENERATE_LOSS: True
+    USE_FOCAL_LOSS: False
+    GENERATE_LOSS_WEIGHT: 1.0
+    USE_ALL_NEGATIVE: True
+    ZERO_SHOT_WEIGHT: '/data_16T/tc/tiancong/code/GenerateU/GenerateU/projects/DDETRS/datasets/lvis/lvis_v1_clip_a+cname_ViT-H.npy'
+    BEAM_SIZE: 3

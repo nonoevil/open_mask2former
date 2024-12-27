@@ -203,6 +203,41 @@ class MLP(nn.Module):
             x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
         return x
 
+class VL_Align(nn.Module):
+    def __init__(self, clamp_dot_product=True,clip_lang_dim=768,maskformer_hidden_dim=256):
+        super().__init__()
+        self.clamp_dot_product = clamp_dot_product
+        # initialize the bias for focal loss
+        # prior_prob = cfg.MODEL.DYHEAD.PRIOR_PROB
+        # bias_value = -math.log((1 - prior_prob) / prior_prob)
+
+        # dot product soft token head
+        self.dot_product_projection_image = nn.Linear(maskformer_hidden_dim, clip_lang_dim, bias=True) # nn.Identity()
+        self.dot_product_projection_text = nn.Identity() #nn.Linear(cfg.MODEL.LANGUAGE_BACKBONE.LANG_DIM, cfg.MODEL.DDETRS.HIDDEN_DIM, bias=True) # 768 -> 256
+        # self.log_scale = nn.Parameter(torch.Tensor([cfg.MODEL.DYHEAD.LOG_SCALE]), requires_grad=True)
+        # self.bias_lang = nn.Parameter(torch.zeros(cfg.MODEL.LANGUAGE_BACKBONE.LANG_DIM), requires_grad=True) # (768，)
+        # self.bias0 = nn.Parameter(torch.Tensor([bias_value]), requires_grad=True) # size (1,)
+    
+    def forward(self, x, embedding):
+        """
+        x: visual features (bs, num_query, 256)
+        embedding: language features (bs, max_num_object, 768)
+        """
+        # embedding = F.normalize(embedding, p=2, dim=-1) # (bs, L, 768) L is maximum sentence length
+        dot_product_proj_tokens = self.dot_product_projection_text(embedding) # 768 -> 256
+        #dot_product_proj_tokens_bias = torch.matmul(embedding, self.bias_lang) + self.bias0 # (bs, L, 768) x (768, ) + (1, ) -> (bs, L)
+
+        dot_product_proj_queries = self.dot_product_projection_image(x) # (bs, num_query, 256)
+        # A = dot_product_proj_queries.shape[1] # num_query
+        # bias = dot_product_proj_tokens_bias.unsqueeze(1).repeat(1, A, 1) # (bs, num_query, L)
+        # tc: queries:(1,300,768) tokens: (1, 19, 768) 
+        # dot_product_logit = (torch.matmul(dot_product_proj_queries, dot_product_proj_tokens.transpose(-1, -2)) / self.log_scale.exp()) + bias # (bs, num_query, 256) x (bs, 256, L) -> (bs, num_query, L)
+        dot_product_logit = torch.matmul(dot_product_proj_queries, dot_product_proj_tokens.transpose(-1, -2))
+        if self.clamp_dot_product:
+            dot_product_logit = torch.clamp(dot_product_logit, max=50000)
+            dot_product_logit = torch.clamp(dot_product_logit, min=-50000)
+        return dot_product_logit
+
 
 @TRANSFORMER_DECODER_REGISTRY.register()
 class MultiScaleMaskedTransformerDecoder(nn.Module):
@@ -247,6 +282,8 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         pre_norm: bool,
         mask_dim: int,
         enforce_input_project: bool,
+        clamp_dot_product:True,
+        clip_lang_dim:768,
     ):
         """
         NOTE: this interface is experimental.
@@ -329,9 +366,18 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
                 self.input_proj.append(nn.Sequential())
 
         # output FFNs
-        if self.mask_classification:
-            self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.class_embed = nn.Linear(hidden_dim, num_classes + 1)
+        self.binary_class_embed = nn.Linear(hidden_dim, 1) # binary classfication
+
+        self.VL_class_embed =  nn.ModuleList()
+        for _ in range(self.num_layers+1):
+            self.VL_class_embed.append(VL_Align(clamp_dot_product=clamp_dot_product,
+                                                clip_lang_dim=clip_lang_dim,
+                                                maskformer_hidden_dim=hidden_dim))
+        
+
         self.mask_embed = MLP(hidden_dim, hidden_dim, mask_dim, 3)
+        self.iou_head = nn.ModuleList([nn.Linear(hidden_dim, 1) for _ in range(self.num_layers+1)])
 
     @classmethod
     def from_config(cls, cfg, in_channels, mask_classification):
@@ -358,9 +404,11 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
 
         ret["mask_dim"] = cfg.MODEL.SEM_SEG_HEAD.MASK_DIM
 
+        ret["clamp_dot_product"] = cfg.MODEL.VL.CLAMP_DOT_PRODUCT
+        ret["clip_lang_dim"] = cfg.MODEL.VL.CLIP_LANG_DIM
         return ret
 
-    def forward(self, x, mask_features, mask = None):
+    def forward(self, x, mask_features, mask = None,clip_text_features=None):
         # x is a list of multi-scale feature
         assert len(x) == self.num_feature_levels
         src = []
@@ -384,14 +432,17 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         # QxNxC
         query_embed = self.query_embed.weight.unsqueeze(1).repeat(1, bs, 1)
         output = self.query_feat.weight.unsqueeze(1).repeat(1, bs, 1)
-
+        # (100,1,256)
         predictions_class = []
         predictions_mask = []
-
+        outputs = [] # (bs,100,256)
+        VL_embeds = []
+        output_ious = []
         # prediction heads on learnable query features
-        outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
+        outputs_class, outputs_mask, attn_mask= self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[0])
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
+        outputs.append(output.transpose(0, 1))
 
         for i in range(self.num_layers):
             level_index = i % self.num_feature_levels
@@ -418,22 +469,38 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
             outputs_class, outputs_mask, attn_mask = self.forward_prediction_heads(output, mask_features, attn_mask_target_size=size_list[(i + 1) % self.num_feature_levels])
             predictions_class.append(outputs_class)
             predictions_mask.append(outputs_mask)
+            outputs.append(output.transpose(0, 1))
+            
 
         assert len(predictions_class) == self.num_layers + 1
 
+        VL_embeds = []
+        
+        for i in range(self.num_layers+1):
+                if clip_text_features != None:
+                    VL_embed = self.VL_class_embed[i](outputs[i], clip_text_features)
+                    VL_embeds.append(VL_embed)
+                mask_iou = self.iou_head[i](outputs[i])
+                output_ious.append(mask_iou)   
+                
         out = {
-            'pred_logits': predictions_class[-1],
+            'binary_class': predictions_class[-1],
             'pred_masks': predictions_mask[-1],
             'aux_outputs': self._set_aux_loss(
-                predictions_class if self.mask_classification else None, predictions_mask
-            )
+                VL_embeds if self.mask_classification else None, predictions_mask, output_ious,predictions_class
+            ),
+            'pred_logits': VL_embed if clip_text_features is not None else None ,
+            'mask2former_output':outputs[-1],
+            'pred_iou': output_ious[-1],
         }
+        
+            
         return out
 
     def forward_prediction_heads(self, output, mask_features, attn_mask_target_size):
         decoder_output = self.decoder_norm(output)
         decoder_output = decoder_output.transpose(0, 1)
-        outputs_class = self.class_embed(decoder_output)
+        outputs_class = self.binary_class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
         outputs_mask = torch.einsum("bqc,bchw->bqhw", mask_embed, mask_features)
 
@@ -448,14 +515,17 @@ class MultiScaleMaskedTransformerDecoder(nn.Module):
         return outputs_class, outputs_mask, attn_mask
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_seg_masks):
+    def _set_aux_loss(self, outputs_class, outputs_seg_masks,output_ious,predictions_class):
         # this is a workaround to make torchscript happy, as torchscript
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
         if self.mask_classification:
             return [
-                {"pred_logits": a, "pred_masks": b}
-                for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
+                {"pred_logits": a, "pred_masks": b,'pred_iou':c, "binary_class":d}
+                for a, b, c,d in zip(outputs_class[:-1], outputs_seg_masks[:-1],output_ious[:-1],predictions_class[:-1])
             ]
         else:
-            return [{"pred_masks": b} for b in outputs_seg_masks[:-1]]
+            return [
+                {"pred_masks": b,'pred_iou':c, "binary_class":d}
+                for  b, c,d in zip( outputs_seg_masks[:-1],output_ious[:-1],predictions_class[:-1])
+            ]

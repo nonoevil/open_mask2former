@@ -12,9 +12,12 @@ from detectron2.modeling.backbone import Backbone
 from detectron2.modeling.postprocessing import sem_seg_postprocess
 from detectron2.structures import Boxes, ImageList, Instances, BitMasks
 from detectron2.utils.memory import retry_if_cuda_oom
+import clip
 
 from .modeling.criterion import SetCriterion
 from .modeling.matcher import HungarianMatcher
+from .modeling.text import Generate_with_T5
+
 
 
 @META_ARCH_REGISTRY.register()
@@ -43,6 +46,8 @@ class MaskFormer(nn.Module):
         panoptic_on: bool,
         instance_on: bool,
         test_topk_per_image: int,
+        train_class_json:str,
+        beam_size:int,
     ):
         """
         Args:
@@ -76,6 +81,8 @@ class MaskFormer(nn.Module):
         self.overlap_threshold = overlap_threshold
         self.object_mask_threshold = object_mask_threshold
         self.metadata = metadata
+        
+
         if size_divisibility < 0:
             # use backbone size_divisibility if not set
             size_divisibility = self.backbone.size_divisibility
@@ -83,6 +90,11 @@ class MaskFormer(nn.Module):
         self.sem_seg_postprocess_before_inference = sem_seg_postprocess_before_inference
         self.register_buffer("pixel_mean", torch.Tensor(pixel_mean).view(-1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor(pixel_std).view(-1, 1, 1), False)
+
+        self.clip_model, _ = clip.load("ViT-L/14@336px")
+        self.clip_model.to(self.device)
+        for p in self.clip_model.parameters():
+                p.requires_grad_(False)
 
         # additional args
         self.semantic_on = semantic_on
@@ -93,6 +105,10 @@ class MaskFormer(nn.Module):
         if not self.semantic_on:
             assert self.sem_seg_postprocess_before_inference
 
+        import json
+        with open(train_class_json, 'r') as f_in:
+            self.class_texts = json.load(f_in)
+        self.beam_size = beam_size
     @classmethod
     def from_config(cls, cfg):
         backbone = build_backbone(cfg)
@@ -115,7 +131,8 @@ class MaskFormer(nn.Module):
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
         )
 
-        weight_dict = {"loss_ce": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight}
+        weight_dict = {"loss_VL": class_weight, "loss_mask": mask_weight, "loss_dice": dice_weight,
+                       "loss_binary":class_weight}
 
         if deep_supervision:
             dec_layers = cfg.MODEL.MASK_FORMER.DEC_LAYERS
@@ -124,18 +141,26 @@ class MaskFormer(nn.Module):
                 aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
             weight_dict.update(aux_weight_dict)
 
-        losses = ["labels", "masks"]
+        losses = ['labelsVL','masks']
 
+        generate_with_t5 = Generate_with_T5(cfg=cfg)
+        
         criterion = SetCriterion(
             sem_seg_head.num_classes,
             matcher=matcher,
+            generate_with_t5=generate_with_t5,
             weight_dict=weight_dict,
             eos_coef=no_object_weight,
             losses=losses,
             num_points=cfg.MODEL.MASK_FORMER.TRAIN_NUM_POINTS,
             oversample_ratio=cfg.MODEL.MASK_FORMER.OVERSAMPLE_RATIO,
             importance_sample_ratio=cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO,
+            train_class_json = cfg.MODEL.MASK_FORMER.TRAIN_CLASS_JSON,
+            focal_alpha = cfg.MODEL.MASK_FORMER.FOCAL_ALPHA,
         )
+
+        
+
 
         return {
             "backbone": backbone,
@@ -158,6 +183,8 @@ class MaskFormer(nn.Module):
             "instance_on": cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON,
             "panoptic_on": cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON,
             "test_topk_per_image": cfg.TEST.DETECTIONS_PER_IMAGE,
+            "train_class_json":cfg.MODEL.MASK_FORMER.TRAIN_CLASS_JSON,
+            "beam_size":cfg.MODEL.TEXT.BEAM_SIZE,
         }
 
     @property
@@ -195,7 +222,8 @@ class MaskFormer(nn.Module):
         images = ImageList.from_tensors(images, self.size_divisibility)
 
         features = self.backbone(images.tensor)
-        outputs = self.sem_seg_head(features)
+       
+        
 
         if self.training:
             # mask classification target
@@ -205,19 +233,27 @@ class MaskFormer(nn.Module):
             else:
                 targets = None
 
+            clip_text_features = self.language_feature_forward(targets)
+            outputs = self.sem_seg_head(features, clip_text_features=clip_text_features)
             # bipartite matching-based loss
             losses = self.criterion(outputs, targets)
 
             for k in list(losses.keys()):
                 if k in self.criterion.weight_dict:
                     losses[k] *= self.criterion.weight_dict[k]
-                else:
-                    # remove this loss if not specified in `weight_dict`
-                    losses.pop(k)
+
             return losses
         else:
-            mask_cls_results = outputs["pred_logits"]
+            outputs = self.sem_seg_head(features)
+            mask_cls_results = outputs["binary_class"]
             mask_pred_results = outputs["pred_masks"]
+            mask_ious = outputs["pred_iou"]
+            mask2former_output = outputs["mask2former_output"]
+            mask2former_output = mask2former_output.transpose(1,0) 
+            atts_t5 = torch.ones(mask2former_output.size()[:-1], dtype=torch.long).to(mask2former_output.device)
+
+            text_decoder_output = self.criterion.class_generate.text_decoder({'object_features': mask2former_output, 'atts_t5': atts_t5}, num_beams=3) 
+            mask2former_texts = text_decoder_output ["pred_object_descriptions"]
             # upsample masks
             mask_pred_results = F.interpolate(
                 mask_pred_results,
@@ -229,12 +265,16 @@ class MaskFormer(nn.Module):
             del outputs
 
             processed_results = []
-            for mask_cls_result, mask_pred_result, input_per_image, image_size in zip(
-                mask_cls_results, mask_pred_results, batched_inputs, images.image_sizes
+            for mask_cls_result, mask_pred_result,mask2former_text, mask_iou,input_per_image, image_size in zip(
+                mask_cls_results, mask_pred_results, mask2former_texts, mask_ious, batched_inputs, images.image_sizes
             ):
                 height = input_per_image.get("height", image_size[0])
                 width = input_per_image.get("width", image_size[1])
                 processed_results.append({})
+
+                pred_object_des = []
+                for ii in range(0,len(mask2former_text),self.beam_size):
+                    pred_object_des.append(', '.join(mask2former_text[ii:ii+self.beam_size]))
 
                 if self.sem_seg_postprocess_before_inference:
                     mask_pred_result = retry_if_cuda_oom(sem_seg_postprocess)(
@@ -244,22 +284,34 @@ class MaskFormer(nn.Module):
 
                 # semantic segmentation inference
                 if self.semantic_on:
-                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result)
+                    r = retry_if_cuda_oom(self.semantic_inference)(mask_cls_result, mask_pred_result,mask_iou)
                     if not self.sem_seg_postprocess_before_inference:
                         r = retry_if_cuda_oom(sem_seg_postprocess)(r, image_size, height, width)
                     processed_results[-1]["sem_seg"] = r
+                    processed_results[-1]["sem_seg_class"] = pred_object_des
 
                 # panoptic segmentation inference
                 if self.panoptic_on:
-                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result)
+                    panoptic_r = retry_if_cuda_oom(self.panoptic_inference)(mask_cls_result, mask_pred_result,mask_iou)
                     processed_results[-1]["panoptic_seg"] = panoptic_r
                 
                 # instance segmentation inference
                 if self.instance_on:
-                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result)
+                    instance_r = retry_if_cuda_oom(self.instance_inference)(mask_cls_result, mask_pred_result,mask_iou)
                     processed_results[-1]["instances"] = instance_r
 
             return processed_results
+
+    def language_feature_forward(self, targets):
+        max_len = max([len(target['labels']) for target in targets])
+        clip_text_features = torch.zeros(len(targets), max_len, 768).to(self.device)
+        for ii, target in enumerate(targets):
+            text = [clip.tokenize(['a '+ self.class_texts[label]]) for label in target['labels']]
+            text = torch.stack(text, dim=0).squeeze(1).to(self.device)
+            text_features = self.clip_model.encode_text(text)
+            text_features = text_features / text_features.norm(dim=1, keepdim=True)
+            clip_text_features[ii:ii+1, :text_features.size(0), :] = text_features
+        return clip_text_features
 
     def prepare_targets(self, targets, images):
         h_pad, w_pad = images.tensor.shape[-2:]
@@ -277,11 +329,14 @@ class MaskFormer(nn.Module):
             )
         return new_targets
 
-    def semantic_inference(self, mask_cls, mask_pred):
-        mask_cls = F.softmax(mask_cls, dim=-1)[..., :-1]
+    def semantic_inference(self, mask_cls, mask_pred,mask_iou):
+        mask_cls = mask_cls.sigmoid()*mask_iou.sigmoid()
+        mask_cls = mask_cls.unsqueeze(2)
         mask_pred = mask_pred.sigmoid()
-        semseg = torch.einsum("qc,qhw->chw", mask_cls, mask_pred)
-        return semseg
+        mask_pred = mask_pred*mask_cls
+        return mask_pred
+
+        
 
     def panoptic_inference(self, mask_cls, mask_pred):
         scores, labels = F.softmax(mask_cls, dim=-1).max(-1)

@@ -16,7 +16,8 @@ import copy
 import itertools
 import logging
 import os
-
+os.environ["CUDA_VISIBLE_DEVICES"] = "4"  # 只使用 GPU 0 和 1
+os.environ["DETECTRON2_DATASETS"] = "/data_16T/tc/tiancong/code/mask2former/datasets"
 from collections import OrderedDict
 from typing import Any, Dict, List, Set
 
@@ -39,9 +40,10 @@ from detectron2.evaluation import (
     COCOPanopticEvaluator,
     DatasetEvaluators,
     LVISEvaluator,
-    SemSegEvaluator,
+    # SemSegEvaluator,
     verify_results,
 )
+from mask2former.evaluation.open_ended_semseg import SemSegEvaluator
 from detectron2.projects.deeplab import add_deeplab_config, build_lr_scheduler
 from detectron2.solver.build import maybe_add_gradient_clipping
 from detectron2.utils.logger import setup_logger
@@ -57,6 +59,10 @@ from mask2former import (
     SemanticSegmentorWithTTA,
     add_maskformer2_config,
 )
+
+
+
+
 
 
 class Trainer(DefaultTrainer):
@@ -78,65 +84,67 @@ class Trainer(DefaultTrainer):
         evaluator_list = []
         evaluator_type = MetadataCatalog.get(dataset_name).evaluator_type
         # semantic segmentation
+        print(evaluator_type)
         if evaluator_type in ["sem_seg", "ade20k_panoptic_seg"]:
             evaluator_list.append(
                 SemSegEvaluator(
                     dataset_name,
                     distributed=True,
                     output_dir=output_folder,
+                    device = cfg.MODEL.DEVICE,
                 )
             )
         # instance segmentation
-        if evaluator_type == "coco":
-            evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-        # panoptic segmentation
-        if evaluator_type in [
-            "coco_panoptic_seg",
-            "ade20k_panoptic_seg",
-            "cityscapes_panoptic_seg",
-            "mapillary_vistas_panoptic_seg",
-        ]:
-            if cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
-                evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
-        # COCO
-        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
-            evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-            evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
-        # Mapillary Vistas
-        if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
-            evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
-        if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-            evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
-        # Cityscapes
-        if evaluator_type == "cityscapes_instance":
-            assert (
-                torch.cuda.device_count() > comm.get_rank()
-            ), "CityscapesEvaluator currently do not work with multiple machines."
-            return CityscapesInstanceEvaluator(dataset_name)
-        if evaluator_type == "cityscapes_sem_seg":
-            assert (
-                torch.cuda.device_count() > comm.get_rank()
-            ), "CityscapesEvaluator currently do not work with multiple machines."
-            return CityscapesSemSegEvaluator(dataset_name)
-        if evaluator_type == "cityscapes_panoptic_seg":
-            if cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
-                assert (
-                    torch.cuda.device_count() > comm.get_rank()
-                ), "CityscapesEvaluator currently do not work with multiple machines."
-                evaluator_list.append(CityscapesSemSegEvaluator(dataset_name))
-            if cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
-                assert (
-                    torch.cuda.device_count() > comm.get_rank()
-                ), "CityscapesEvaluator currently do not work with multiple machines."
-                evaluator_list.append(CityscapesInstanceEvaluator(dataset_name))
-        # ADE20K
-        if evaluator_type == "ade20k_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
-            evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
-        # LVIS
+        # if evaluator_type == "coco":
+        #     evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
+        # # panoptic segmentation
+        # if evaluator_type in [
+        #     "coco_panoptic_seg",
+        #     "ade20k_panoptic_seg",
+        #     "cityscapes_panoptic_seg",
+        #     "mapillary_vistas_panoptic_seg",
+        # ]:
+        #     if cfg.MODEL.MASK_FORMER.TEST.PANOPTIC_ON:
+        #         evaluator_list.append(COCOPanopticEvaluator(dataset_name, output_folder))
+        # # COCO
+        # if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        #     evaluator_list.append(COCOEvaluator(dataset_name, output_dir=output_folder))
+        # if evaluator_type == "coco_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+        #     evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
+        # # Mapillary Vistas
+        # if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        #     evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
+        # if evaluator_type == "mapillary_vistas_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+        #     evaluator_list.append(SemSegEvaluator(dataset_name, distributed=True, output_dir=output_folder))
+        # # Cityscapes
+        # if evaluator_type == "cityscapes_instance":
+        #     assert (
+        #         torch.cuda.device_count() > comm.get_rank()
+        #     ), "CityscapesEvaluator currently do not work with multiple machines."
+        #     return CityscapesInstanceEvaluator(dataset_name)
+        # if evaluator_type == "cityscapes_sem_seg":
+        #     assert (
+        #         torch.cuda.device_count() > comm.get_rank()
+        #     ), "CityscapesEvaluator currently do not work with multiple machines."
+        #     return CityscapesSemSegEvaluator(dataset_name)
+        # if evaluator_type == "cityscapes_panoptic_seg":
+        #     if cfg.MODEL.MASK_FORMER.TEST.SEMANTIC_ON:
+        #         assert (
+        #             torch.cuda.device_count() > comm.get_rank()
+        #         ), "CityscapesEvaluator currently do not work with multiple machines."
+        #         evaluator_list.append(CityscapesSemSegEvaluator(dataset_name))
+        #     if cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        #         assert (
+        #             torch.cuda.device_count() > comm.get_rank()
+        #         ), "CityscapesEvaluator currently do not work with multiple machines."
+        #         evaluator_list.append(CityscapesInstanceEvaluator(dataset_name))
+        # # ADE20K
+        # if evaluator_type == "ade20k_panoptic_seg" and cfg.MODEL.MASK_FORMER.TEST.INSTANCE_ON:
+        #     evaluator_list.append(InstanceSegEvaluator(dataset_name, output_dir=output_folder))
+        # # LVIS
         if evaluator_type == "lvis":
             return LVISEvaluator(dataset_name, output_dir=output_folder)
-        if len(evaluator_list) == 0:
+        if len(evaluator_list) == 0:    
             raise NotImplementedError(
                 "no Evaluator for the dataset {} with the type {}".format(
                     dataset_name, evaluator_type
@@ -286,6 +294,8 @@ def setup(args):
     # for poly lr schedule
     add_deeplab_config(cfg)
     add_maskformer2_config(cfg)
+    print("Config file:", args.config_file)
+    print("Loaded config:", cfg)
     cfg.merge_from_file(args.config_file)
     cfg.merge_from_list(args.opts)
     cfg.freeze()
@@ -311,12 +321,29 @@ def main(args):
         return res
 
     trainer = Trainer(cfg)
-    trainer.resume_or_load(resume=args.resume)
+    # trainer.resume_or_load(resume=args.resume)
     return trainer.train()
 
 
 if __name__ == "__main__":
-    args = default_argument_parser().parse_args()
+    from argparse import Namespace
+    # args = Namespace(config_file='/data_16T/tc/tiancong/code/mask2former/mask2former/configs/coco/panoptic-segmentation/maskformer2_R50_bs16_50ep.yaml', 
+    #                  dist_url='tcp://127.0.0.1:50159', 
+    #                  eval_only=False, 
+    #                  machine_rank=0, 
+    #                  num_gpus=1, 
+    #                  num_machines=1, 
+    #                  opts=['MODEL.WEIGHTS', '/data_16T/tc/tiancong/code/mask2former/mask2former/output/model_final.pth'], 
+                    #  resume=False)
+
+    args = Namespace(config_file='/data_16T/tc/tiancong/code/mask2former/mask2former/configs/coco/panoptic-segmentation/maskformer2_R50_bs16_50ep.yaml', 
+                     dist_url='tcp://127.0.0.1:50159', 
+                     eval_only=True, 
+                     machine_rank=0, 
+                     num_gpus=1, 
+                     num_machines=1, 
+                     opts=['MODEL.WEIGHTS', '/data_16T/tc/tiancong/code/mask2former/mask2former/output/model_final.pth'], 
+                     resume=False)
     print("Command Line Args:", args)
     launch(
         main,

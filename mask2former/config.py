@@ -112,3 +112,24 @@ def add_maskformer2_config(cfg):
     # Importance sampling parameter for PointRend point sampling during training. Parametr `beta` in
     # the original paper.
     cfg.MODEL.MASK_FORMER.IMPORTANCE_SAMPLE_RATIO = 0.75
+
+
+    # TEXT
+    cfg.MODEL.TEXT = CN()
+    cfg.MODEL.TEXT.FIX_TEXT_DECODER = True
+    cfg.MODEL.TEXT.TEXT_DECODER = 'google/flan-t5-large'
+    cfg.MODEL.TEXT.ZERO_SHOT_WEIGHT = 'datasets/lvis/lvis_v1_clip_a+cname.npy'
+    cfg.MODEL.USE_MULTI_BBOX_EMBED = False
+    cfg.MODEL.TEXT.USE_ALL_NEGATIVE = False
+    cfg.MODEL.TEXT.USE_GENERATE_LOSS = False
+    cfg.MODEL.TEXT.USE_FOCAL_LOSS = False
+    cfg.MODEL.TEXT.GENERATE_LOSS_WEIGHT = 1.0
+    cfg.MODEL.TEXT.BEAM_SIZE = 3
+    cfg.MODEL.TEXT.WEIGHT = "/data_16T/tc/tiancong/code/GenerateU/GenerateU/projects/DDETRS/t5_model.pth"
+
+    cfg.MODEL.MASK_FORMER.TRAIN_CLASS_JSON = "datasets/coco.json"
+    cfg.MODEL.VL = CN()
+    cfg.MODEL.VL.CLIP_LANG_DIM = 768
+    cfg.MODEL.VL.CLAMP_DOT_PRODUCT = True
+    
+    cfg.MODEL.MASK_FORMER.FOCAL_ALPHA = 0.25
